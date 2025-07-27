@@ -1,0 +1,50 @@
+dino:
+  head_n_prototypes: 512
+  head_bottleneck_dim: 384
+ibot:
+  separate_head: true
+  head_n_prototypes: 512
+train:
+  batch_size_per_gpu: 64
+  dataset_path: MyDataset3D
+  centering: sinkhorn_knopp
+student:
+  arch: vit_small
+  mode: 3D
+  in_chans: 1
+  patch_size: 16
+  drop_path_rate: 0.4
+  ffn_layer: swiglufused
+  block_chunks: 4
+  num_register_tokens: 4
+  pretrained_from_hub:
+    org: facebookresearch/dinov2
+    model_name: dinov2_vits14_reg
+teacher:
+  momentum_teacher: 0.994
+  warmup_teacher_temp: 0.01
+  teacher_temp: 0.04
+optim:
+  epochs: 500
+  weight_decay_end: 0.2
+  base_lr: 2e-04  # learning rate for a batch size of 1024
+  warmup_epochs: 0 #10
+  layerwise_decay: 1.0
+crops:
+  # local_crops_size: 96
+  local_crops_size: 64
+  local_crops_number: 4
+evaluation:
+  cls_model:
+    head:
+      registry: classification_heads
+      model_name: attn_pool
+      n_classes: 18
+      embed_dim: 384
+    sw:
+      patch_size: 128
+      stride: 64
+      batch_size: 20
+    head_pretrained_path: null
+  lr: 2e-5
+  per_device_batch_size: 8

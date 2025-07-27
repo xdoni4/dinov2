@@ -58,7 +58,14 @@ class MetricLogger(object):
             iter_time=iter_time,
             data_time=data_time,
         )
-        dict_to_dump.update({k: v.median for k, v in self.meters.items()})
+        upd_dict = {}
+        for k, v in self.meters.items():
+            if "validation" in k or "val" in k:
+                upd_dict[k] = v.value
+            else:
+                upd_dict[k] = v.median
+        dict_to_dump.update(upd_dict)
+        # dict_to_dump.update({k: v.median for k, v in self.meters.items()})
         with open(self.output_file, "a") as f:
             f.write(json.dumps(dict_to_dump) + "\n")
         pass

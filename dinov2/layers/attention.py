@@ -79,6 +79,65 @@ class Attention(nn.Module):
         return x
 
 
+class AttentionQKVSplit(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        q_bias: bool = True,
+        k_bias: bool = False,
+        v_bias: bool = True,
+        proj_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim**-0.5
+
+        self.q = nn.Linear(dim, dim, bias=q_bias)
+        self.k = nn.Linear(dim, dim, bias=k_bias)
+        self.v = nn.Linear(dim, dim, bias=v_bias)
+        self.attn_drop = attn_drop
+        self.proj = nn.Linear(dim, dim, bias=proj_bias)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def init_weights(
+        self, init_attn_std: float | None = None, init_proj_std: float | None = None, factor: float = 1.0
+    ) -> None:
+        init_attn_std = init_attn_std or (self.dim**-0.5)
+        init_proj_std = init_proj_std or init_attn_std * factor
+        nn.init.normal_(self.q.weight, std=init_attn_std)
+        nn.init.normal_(self.k.weight, std=init_attn_std)
+        nn.init.normal_(self.v.weight, std=init_attn_std)
+
+        nn.init.normal_(self.proj.weight, std=init_proj_std)
+        if self.q.bias is not None:
+            nn.init.zeros_(self.q.bias)
+        if self.k.bias is not None:
+            nn.init.zeros_(self.k.bias)
+        if self.v.bias is not None:
+            nn.init.zeros_(self.v.bias)
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: Tensor, is_causal: bool = False) -> Tensor:
+        B, N, C = x.shape
+        q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads)
+        k = self.k(x).reshape(B, N, self.num_heads, C // self.num_heads)
+        v = self.v(x).reshape(B, N, self.num_heads, C // self.num_heads)
+
+        q, k, v = [t.transpose(1, 2) for t in [q, k, v]]
+        x = nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, dropout_p=self.attn_drop if self.training else 0, is_causal=is_causal
+        )
+        x = x.transpose(1, 2).contiguous().view(B, N, C)
+        x = self.proj_drop(self.proj(x))
+        return x
+
+
 class MemEffAttention(Attention):
     def forward(self, x: Tensor, attn_bias=None) -> Tensor:
         if not XFORMERS_AVAILABLE:
@@ -90,6 +149,26 @@ class MemEffAttention(Attention):
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
 
         q, k, v = unbind(qkv, 2)
+
+        x = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
+        x = x.reshape([B, N, C])
+
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+    
+
+class MemEffAttentionQKVSplit(AttentionQKVSplit):
+    def forward(self, x: Tensor, attn_bias=None) -> Tensor:
+        if not XFORMERS_AVAILABLE:
+            if attn_bias is not None:
+                raise AssertionError("xFormers is required for using nested tensors")
+            return super().forward(x)
+
+        B, N, C = x.shape
+        q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads)
+        k = self.k(x).reshape(B, N, self.num_heads, C // self.num_heads)
+        v = self.v(x).reshape(B, N, self.num_heads, C // self.num_heads)
 
         x = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
         x = x.reshape([B, N, C])

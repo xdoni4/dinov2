@@ -1,29 +1,29 @@
-[tool.black]
-line-length = 120
-
-[tool.pylint.master]
-persistent = false
-score = false
-
-[tool.pylint.messages_control]
-disable = "all"
-enable = [
-  "miscellaneous",
-  "similarities",
+[project]
+name = "dinov2"
+requires-python = ">=3.10"
+version = "0.0.1"
+description = "DINOv2 implementation for 3D input"
+authors = [
+  {name = "Daniel Ignatyev", email = "dania.ignat@yandex.ru"},
 ]
 
-[tool.pylint.similarities]
-ignore-comments = true
-ignore-docstrings = true
-ignore-imports = true
-min-similarity-lines = 8
+dependencies = [
+  "torch==2.6.0",
+  "omegaconf==2.3.0",
+  "torchmetrics==1.4.0.post0",
+  "fvcore==0.1.5.post20221221",
+  "iopath==0.1.10",
+  "flash_attn==2.0.2",
+  "cotomka @ git+https://github.com/mishgon/cotomka@cb1143188a8c772bc4c96c565671b52c8121bfbf",
+  "xformers @ git+https://github.com/facebookresearch/xformers@v0.0.28.post3",
+  "medeval @ git+https://github.com/xdoni4/medeval@d98f3dee98a4534901b8f8f927602e09e962aaee",
+  "ipykernel"
 
-[tool.pylint.reports]
-reports = false
-
-[tool.pylint.miscellaneous]
-notes = [
-  "FIXME",
-  "XXX",
-  "TODO",
 ]
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+
+[tool.pdm.build]
+requires = ["torch==2.6.0"]

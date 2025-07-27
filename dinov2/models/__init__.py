@@ -16,6 +16,10 @@ def build_model(args, only_teacher=False, img_size=224):
     if "vit" in args.arch:
         vit_kwargs = dict(
             img_size=img_size,
+            mode=args.mode if args.mode else "2D",
+            in_chans=args.in_chans if args.in_chans else 3,
+            pos_embed_for_register_tokens=args.pos_embed_for_register_tokens if args.pos_embed_for_register_tokens else False,
+            split_qkv=args.split_qkv if args.split_qkv else False,
             patch_size=args.patch_size,
             init_values=args.layerscale,
             ffn_layer=args.ffn_layer,

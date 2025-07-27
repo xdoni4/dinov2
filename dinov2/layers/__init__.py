@@ -6,7 +6,7 @@
 from .dino_head import DINOHead
 from .layer_scale import LayerScale
 from .mlp import Mlp
-from .patch_embed import PatchEmbed
+from .patch_embed import PatchEmbed, PatchEmbed3D
 from .swiglu_ffn import SwiGLUFFN, SwiGLUFFNFused, SwiGLUFFNAligned
 from .block import NestedTensorBlock, CausalAttentionBlock
-from .attention import Attention, MemEffAttention
+from .attention import Attention, MemEffAttention, AttentionQKVSplit, MemEffAttentionQKVSplit

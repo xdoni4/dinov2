@@ -3,12 +3,14 @@
 # This source code is licensed under the Apache License, Version 2.0
 # found in the LICENSE file in the root directory of this source tree.
 
+import torch
 import logging
+
 from enum import Enum
+from torch.utils.data import Sampler
+from multiprocessing.pool import ThreadPool
 from typing import Any, Callable, List, Optional, TypeVar
 
-import torch
-from torch.utils.data import Sampler
 
 from .datasets import ImageNet, ImageNet22k
 from .samplers import EpochSampler, InfiniteSampler, ShardedInfiniteSampler
@@ -220,3 +222,25 @@ def make_data_loader(
     except TypeError:  # data loader has no length
         logger.info("infinite data loader")
     return data_loader
+
+
+class InfinitePrefetchedDataloader:
+    def __init__(self, prefetched_dataset, batch_size, collate_fn, transform):
+        self.prefetched_dataset = prefetched_dataset
+        self.batch_size = batch_size
+        self.collate_fn = collate_fn
+        self.transform = transform
+
+    def __iter__(self):
+        iterator = self._get_batch()
+        return iterator
+
+    def _get_batch(self):
+        while True:
+            prefetched_data = [self.prefetched_dataset.__getitem__() for _ in range(self.batch_size)]
+            augmented_data = prefetched_data
+            if self.transform is not None:
+                with ThreadPool(8) as p:
+                    augmented_data = p.map(self.transform, prefetched_data)
+            collated_crops = self.collate_fn(augmented_data)
+            yield collated_crops

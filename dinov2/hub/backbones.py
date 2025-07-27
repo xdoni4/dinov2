@@ -28,6 +28,7 @@ def _make_dinov2_model(
     interpolate_offset: float = 0.1,
     pretrained: bool = True,
     weights: Union[Weights, str] = Weights.LVD142M,
+    return_state_dict=False,
     **kwargs,
 ):
     from ..models import vision_transformer as vits
@@ -56,6 +57,8 @@ def _make_dinov2_model(
         model_full_name = _make_dinov2_model_name(arch_name, patch_size, num_register_tokens)
         url = _DINOV2_BASE_URL + f"/{model_base_name}/{model_full_name}_pretrain.pth"
         state_dict = torch.hub.load_state_dict_from_url(url, map_location="cpu")
+        if return_state_dict:
+            return state_dict
         model.load_state_dict(state_dict, strict=True)
 
     return model

@@ -15,7 +15,7 @@ import warnings
 import torch
 from torch import nn, Tensor
 
-from .attention import Attention, MemEffAttention
+from .attention import Attention, AttentionQKVSplit, MemEffAttention, MemEffAttentionQKVSplit
 from .drop_path import DropPath
 from .layer_scale import LayerScale
 from .mlp import Mlp
@@ -61,14 +61,23 @@ class Block(nn.Module):
         super().__init__()
         # print(f"biases: qkv: {qkv_bias}, proj: {proj_bias}, ffn: {ffn_bias}")
         self.norm1 = norm_layer(dim)
-        self.attn = attn_class(
-            dim,
-            num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            proj_bias=proj_bias,
-            attn_drop=attn_drop,
-            proj_drop=drop,
-        )
+        if (attn_class is AttentionQKVSplit) or (attn_class is MemEffAttentionQKVSplit):
+            self.attn = attn_class(
+                dim,
+                num_heads=num_heads,
+                proj_bias=proj_bias,
+                attn_drop=attn_drop,
+                proj_drop=drop,
+            )
+        else:
+            self.attn = attn_class(
+                dim,
+                num_heads=num_heads,
+                qkv_bias=qkv_bias,
+                proj_bias=proj_bias,
+                attn_drop=attn_drop,
+                proj_drop=drop,
+            )
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
@@ -76,6 +85,7 @@ class Block(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = ffn_layer(
             in_features=dim,
+            norm_layer=norm_layer,
             hidden_features=mlp_hidden_dim,
             act_layer=act_layer,
             drop=drop,
@@ -269,7 +279,7 @@ class NestedTensorBlock(Block):
         """
         x_list contains a list of tensors to nest together and run
         """
-        assert isinstance(self.attn, MemEffAttention)
+        assert isinstance(self.attn, MemEffAttention) or isinstance(self.attn, MemEffAttentionQKVSplit)
 
         if self.training and self.sample_drop_ratio > 0.0:
 

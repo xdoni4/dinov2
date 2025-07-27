@@ -17,7 +17,11 @@ from dinov2.utils.param_groups import get_params_groups_with_decay, fuse_params_
 from dinov2.fsdp import get_fsdp_wrapper, ShardedGradScaler, get_fsdp_modules, reshard_fsdp_model
 
 from dinov2.models.vision_transformer import BlockChunk
+from torch.nn.parallel import DistributedDataParallel as DDP
+import dinov2.distributed as dist
 
+from copy import deepcopy
+from medeval.classification.models import VitClassificationModel
 
 try:
     from xformers.ops import fmha
@@ -46,6 +50,29 @@ class SSLMetaArch(nn.Module):
             chkpt = torch.load(cfg.student.pretrained_weights)
             logger.info(f"OPTIONS -- pretrained weights: loading from {cfg.student.pretrained_weights}")
             student_backbone.load_state_dict(chkpt["model"], strict=False)
+
+        if cfg.student.pretrained_from_hub:
+            logger.info(f"OPTIONS -- using pretrained model from hub {cfg.student.pretrained_from_hub.org}/{cfg.student.pretrained_from_hub.model_name}")
+            dinov2_from_hub_state_dict = torch.hub.load(cfg.student.pretrained_from_hub.org, cfg.student.pretrained_from_hub.model_name, return_state_dict=True)
+            if self.cfg.student.mode == "2D":
+                student_backbone.load_state_dict(dinov2_from_hub_state_dict)
+                teacher_backbone.load_state_dict(dinov2_from_hub_state_dict)
+            else:
+                remove_keys = [key for key in dinov2_from_hub_state_dict.keys() if "patch_embed" in key]
+                for key in remove_keys:
+                    dinov2_from_hub_state_dict.pop(key)
+                dinov2_from_hub_state_dict.pop("pos_embed")
+                dinov2_from_hub = deepcopy(student_backbone)
+                dinov2_from_hub.load_state_dict(dinov2_from_hub_state_dict, strict=False)
+                student_backbone.blocks = deepcopy(dinov2_from_hub.blocks)
+                teacher_backbone.blocks = deepcopy(dinov2_from_hub.blocks)
+                student_backbone.cls_token = deepcopy(dinov2_from_hub.cls_token)
+                teacher_backbone.cls_token = deepcopy(dinov2_from_hub.cls_token)
+                if cfg.student.num_register_tokens > 0:
+                    student_backbone.register_tokens = deepcopy(dinov2_from_hub.register_tokens)
+                    teacher_backbone.register_tokens = deepcopy(dinov2_from_hub.register_tokens)
+        else:
+            print("not using pretrained model from hub")
 
         self.embed_dim = embed_dim
         self.dino_out_dim = cfg.dino.head_n_prototypes
@@ -119,6 +146,12 @@ class SSLMetaArch(nn.Module):
         for p in self.teacher.parameters():
             p.requires_grad = False
         logger.info(f"Student and Teacher are built: they are both {cfg.student.arch} network.")
+
+        if cfg.evaluation.get("cls_model", None) is not None:
+            self.cls_model = VitClassificationModel(cfg.evaluation.cls_model)
+            head_pretrained_path = cfg.evaluation.cls_model.get("head_pretrained_path", None)
+            if head_pretrained_path is not None:
+                self.cls_model.head.load_state_dict(torch.load(head_pretrained_path)['cls_head'])
 
     def forward(self, inputs):
         raise NotImplementedError
@@ -348,9 +381,11 @@ class SSLMetaArch(nn.Module):
     def fsdp_synchronize_streams(self):
         if self.need_to_synchronize_fsdp_streams:
             torch.cuda.synchronize()
-            self.student.dino_head._streams = (
-                self.teacher.dino_head._streams
-            ) = self.student.backbone._streams = self.teacher.backbone._streams
+            for attr in {"_unshard_stream", "_post_backward_stream", "_pre_unshard_stream", "_all_reduce_stream", "_default_stream"}:
+                 stream = getattr(self.teacher.backbone, attr)
+                 setattr(self.student.dino_head, attr, stream)
+                 setattr(self.teacher.dino_head, attr, stream)
+                 setattr(self.student.backbone, attr, stream)
             self.need_to_synchronize_fsdp_streams = False
 
     def update_teacher(self, m):
@@ -398,3 +433,7 @@ class SSLMetaArch(nn.Module):
             self.student[k] = get_fsdp_wrapper(student_model_cfg, modules_to_wrap={BlockChunk})(self.student[k])
             teacher_model_cfg = self.cfg.compute_precision.teacher[k]
             self.teacher[k] = get_fsdp_wrapper(teacher_model_cfg, modules_to_wrap={BlockChunk})(self.teacher[k])
+        self.cls_model.backbone = self.teacher.backbone
+        for p in self.cls_model.backbone.parameters():
+            p.requires_grad = False
+        self.cls_model.head = get_fsdp_wrapper(teacher_model_cfg, modules_to_wrap={})(self.cls_model.head)

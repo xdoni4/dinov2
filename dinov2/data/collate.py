@@ -5,17 +5,33 @@
 
 import torch
 import random
+import numpy as np
 
 
-def collate_data_and_cast(samples_list, mask_ratio_tuple, mask_probability, dtype, n_tokens=None, mask_generator=None):
-    # dtype = torch.half  # TODO: Remove
+def collate_data_and_cast(
+    samples_list,
+    mask_ratio_tuple,
+    mask_probability, dtype,
+    n_tokens=None,
+    mask_generator=None,
+    transform=None,
+    labels_in_sample=True
+):
+    if transform is not None:
+        samples_list = transform(samples_list[0][None, ...])
 
-    n_global_crops = len(samples_list[0][0]["global_crops"])
-    n_local_crops = len(samples_list[0][0]["local_crops"])
+    if labels_in_sample:
+        n_global_crops = len(samples_list[0][0]["global_crops"])
+        n_local_crops = len(samples_list[0][0]["local_crops"])
 
-    collated_global_crops = torch.stack([s[0]["global_crops"][i] for i in range(n_global_crops) for s in samples_list])
+        collated_global_crops = torch.stack([s[0]["global_crops"][i] for i in range(n_global_crops) for s in samples_list])
+        collated_local_crops = torch.stack([s[0]["local_crops"][i] for i in range(n_local_crops) for s in samples_list])
+    else:
+        n_global_crops = len(samples_list[0]["global_crops"])
+        n_local_crops = len(samples_list[0]["local_crops"])
 
-    collated_local_crops = torch.stack([s[0]["local_crops"][i] for i in range(n_local_crops) for s in samples_list])
+        collated_global_crops = torch.stack([s["global_crops"][i] for i in range(n_global_crops) for s in samples_list])
+        collated_local_crops = torch.stack([s["local_crops"][i] for i in range(n_local_crops) for s in samples_list])
 
     B = len(collated_global_crops)
     N = n_tokens
@@ -47,3 +63,35 @@ def collate_data_and_cast(samples_list, mask_ratio_tuple, mask_probability, dtyp
         "upperbound": upperbound,
         "n_masked_patches": torch.full((1,), fill_value=mask_indices_list.shape[0], dtype=torch.long),
     }
+
+
+def collate_data_for_test(samples_list):
+    images = []
+    labels = []
+    for sample in samples_list:
+        image = sample["image"]
+        if len(image.shape) == 4:
+            image = image[None, ...]
+        images.append(image)
+        if "labels" in sample:
+            labels.append(torch.tensor(list(sample["labels"].values())).float())
+    labels = torch.stack(labels).to(torch.cuda.current_device())
+    return images, labels
+
+
+def collate_data_for_test_any(samples_list):
+    ret = {key : [] for key in samples_list[0].keys()}
+    for sample in samples_list:
+        for key in sample.keys():
+            if key == "image":
+                image = sample["image"]
+                if len(image.shape) == 4:
+                    image = image[None, ...]
+                ret[key].append(image)
+            elif key == "labels":
+                ret[key].append(torch.tensor(list(sample["labels"].values())).float())
+            else:
+                ret[key].append(sample[key])
+    if "labels" in ret:
+        ret["labels"] = torch.stack(ret["labels"]).to(torch.cuda.current_device())
+    return tuple(ret.values())

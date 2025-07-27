@@ -12,14 +12,22 @@ import math
 import logging
 from typing import Sequence, Tuple, Union, Callable
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint
 from torch.nn.init import trunc_normal_
 
-from dinov2.layers import Mlp, PatchEmbed, SwiGLUFFNFused, MemEffAttention, NestedTensorBlock as Block
-
+from dinov2.layers import (
+    Mlp,
+    PatchEmbed,
+    PatchEmbed3D,
+    SwiGLUFFNFused,
+    AttentionQKVSplit,
+    MemEffAttention,
+    MemEffAttentionQKVSplit,
+    NestedTensorBlock as Block
+)
+from timm.layers import SwiGLU as SwiGLU_timm
 
 logger = logging.getLogger("dinov2")
 
@@ -66,6 +74,9 @@ class DinoVisionTransformer(nn.Module):
         num_register_tokens=0,
         interpolate_antialias=False,
         interpolate_offset=0.1,
+        pos_embed_for_register_tokens=False,
+        split_qkv=False,
+        mode="2D"
     ):
         """
         Args:
@@ -93,17 +104,21 @@ class DinoVisionTransformer(nn.Module):
             interpolate_offset: (float) work-around offset to apply when interpolating positional embeddings
         """
         super().__init__()
-        norm_layer = partial(nn.LayerNorm, eps=1e-6)
+        norm_layer = partial(nn.LayerNorm, eps=1e-5)
 
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
-        self.num_tokens = 1
+        self.num_tokens = 1 + (num_register_tokens if pos_embed_for_register_tokens else 0)
         self.n_blocks = depth
         self.num_heads = num_heads
         self.patch_size = patch_size
         self.num_register_tokens = num_register_tokens
         self.interpolate_antialias = interpolate_antialias
         self.interpolate_offset = interpolate_offset
+        self.mode = mode
+        self.pos_embed_for_register_tokens = pos_embed_for_register_tokens
 
+        if self.mode == "3D":
+            embed_layer = PatchEmbed3D
         self.patch_embed = embed_layer(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
 
@@ -117,7 +132,7 @@ class DinoVisionTransformer(nn.Module):
         if drop_path_uniform is True:
             dpr = [drop_path_rate] * depth
         else:
-            dpr = np.linspace(0, drop_path_rate, depth).tolist()  # stochastic depth decay rule
+            dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
 
         if ffn_layer == "mlp":
             logger.info("using MLP layer as FFN")
@@ -125,6 +140,10 @@ class DinoVisionTransformer(nn.Module):
         elif ffn_layer == "swiglufused" or ffn_layer == "swiglu":
             logger.info("using SwiGLU layer as FFN")
             ffn_layer = SwiGLUFFNFused
+        elif ffn_layer == "swiglu_timm":
+            ffn_layer = SwiGLU_timm
+            act_layer = nn.SiLU
+            logger.info("using SwiGLU layer from timm as FFN")
         elif ffn_layer == "identity":
             logger.info("using Identity layer as FFN")
 
@@ -177,7 +196,7 @@ class DinoVisionTransformer(nn.Module):
             nn.init.normal_(self.register_tokens, std=1e-6)
         named_apply(init_weights_vit_timm, self)
 
-    def interpolate_pos_encoding(self, x, w, h):
+    def _interpolate_pos_encoding_2d(self, x, w, h):
         previous_dtype = x.dtype
         npatch = x.shape[1] - 1
         N = self.pos_embed.shape[1] - 1
@@ -211,16 +230,72 @@ class DinoVisionTransformer(nn.Module):
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
         return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1).to(previous_dtype)
 
+    def _interpolate_pos_encoding_3d(self, x, d, h, w):
+        previous_dtype = x.dtype
+        npatch = x.shape[1] - self.num_tokens
+        N = self.pos_embed.shape[1] - self.num_tokens
+        if npatch == N and h == w == d:
+            return self.pos_embed
+        
+        pos_embed = self.pos_embed.float()
+        class_pos_embed = pos_embed[:, 0]
+        patch_pos_embed = pos_embed[:, self.num_tokens:]
+        reg_pos_embed = pos_embed[:, 1:self.num_tokens] if \
+            self.pos_embed_for_register_tokens and (self.register_tokens is not None) else None
+        tokens_pos_embed = torch.cat((class_pos_embed.unsqueeze(0), reg_pos_embed), dim=1) \
+            if reg_pos_embed is not None else class_pos_embed.unsqueeze(0)
+
+        dim = x.shape[-1]
+        h0 = h // self.patch_size
+        w0 = w // self.patch_size
+        d0 = d // self.patch_size
+
+        M = int(math.ceil(N ** (1/3)))  # Recover the number of patches in each dimension
+        assert N == M * M * M
+        kwargs = {}
+        if self.interpolate_offset:
+            # Historical kludge: add a small number to avoid floating point error in the interpolation, see https://github.com/facebookresearch/dino/issues/8
+            # Note: still needed for backward-compatibility, the underlying operators are using both output size and scale factors
+            sx = float(w0 + self.interpolate_offset) / M
+            sy = float(h0 + self.interpolate_offset) / M
+            sz = float(d0 + self.interpolate_offset) / M
+            kwargs["scale_factor"] = (sz, sy, sx)
+        else:
+            # Simply specify an output size instead of a scale factor
+            kwargs["size"] = (d0, h0, w0)
+        patch_pos_embed = nn.functional.interpolate(
+            # patch_pos_embed.reshape(1, M, M, M, dim).permute(0, 4, 3, 1, 2),
+            patch_pos_embed.reshape(1, dim, M, M, M),
+            mode="trilinear",
+            antialias=self.interpolate_antialias,
+            **kwargs,
+        )
+        # print("BEFORE ASSERTION", (d0, h0, w0), patch_pos_embed.shape[-3:])
+        assert (d0, h0, w0) == patch_pos_embed.shape[-3:]
+        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 4, 1).view(1, -1, dim)
+        return torch.cat((tokens_pos_embed, patch_pos_embed), dim=1).to(previous_dtype)
+
     def prepare_tokens_with_masks(self, x, masks=None):
-        B, nc, w, h = x.shape
+        if self.mode == "2D":
+            B, nc, w, h = x.shape
+        else:
+            B, nc, d, h, w = x.shape # d, w, h ???
+        
         x = self.patch_embed(x)
         if masks is not None:
             x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).unsqueeze(0), x)
 
-        x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
-        x = x + self.interpolate_pos_encoding(x, w, h)
+        tokens = self.cls_token.expand(x.shape[0], -1, -1) \
+            if (not self.pos_embed_for_register_tokens) or (self.register_tokens is None) \
+            else torch.cat((self.cls_token.expand(x.shape[0], -1, -1), self.register_tokens.expand(x.shape[0], -1, -1)), dim=1)
+        
+        x = torch.cat((tokens, x), dim=1)
+        if self.mode == "2D":
+            x = x + self._interpolate_pos_encoding_2d(x, w, h)
+        else:
+            x = x + self._interpolate_pos_encoding_3d(x, d, h, w)
 
-        if self.register_tokens is not None:
+        if (not self.pos_embed_for_register_tokens) and (self.register_tokens is not None):
             x = torch.cat(
                 (
                     x[:, :1],
@@ -233,6 +308,8 @@ class DinoVisionTransformer(nn.Module):
         return x
 
     def forward_features_list(self, x_list, masks_list):
+        if masks_list is None:
+            masks_list = [None] * len(x_list)
         x = [self.prepare_tokens_with_masks(x, masks) for x, masks in zip(x_list, masks_list)]
         for blk in self.blocks:
             x = blk(x)
@@ -322,7 +399,7 @@ class DinoVisionTransformer(nn.Module):
             return tuple(zip(outputs, class_tokens))
         return tuple(outputs)
 
-    def forward(self, *args, is_training=False, **kwargs):
+    def forward(self, *args, is_training=True, **kwargs):
         ret = self.forward_features(*args, **kwargs)
         if is_training:
             return ret
@@ -338,49 +415,63 @@ def init_weights_vit_timm(module: nn.Module, name: str = ""):
             nn.init.zeros_(module.bias)
 
 
-def vit_small(patch_size=16, num_register_tokens=0, **kwargs):
+def vit_small(patch_size=16, num_register_tokens=0, split_qkv=False, **kwargs):
     model = DinoVisionTransformer(
         patch_size=patch_size,
         embed_dim=384,
         depth=12,
         num_heads=6,
         mlp_ratio=4,
-        block_fn=partial(Block, attn_class=MemEffAttention),
+        block_fn=partial(Block, attn_class=MemEffAttentionQKVSplit if split_qkv else MemEffAttention),
         num_register_tokens=num_register_tokens,
         **kwargs,
     )
     return model
 
 
-def vit_base(patch_size=16, num_register_tokens=0, **kwargs):
+def vit_medium(patch_size=16, num_register_tokens=0, split_qkv=False, **kwargs):
+    model = DinoVisionTransformer(
+        patch_size=patch_size,
+        embed_dim=864,
+        depth=16,
+        num_heads=12,
+        mlp_ratio=4,
+        block_fn=partial(Block, attn_class=MemEffAttentionQKVSplit if split_qkv else MemEffAttention),
+        num_register_tokens=num_register_tokens,
+        **kwargs,
+    )
+    return model
+
+
+def vit_base(patch_size=16, num_register_tokens=0, split_qkv=False, **kwargs):
     model = DinoVisionTransformer(
         patch_size=patch_size,
         embed_dim=768,
         depth=12,
         num_heads=12,
         mlp_ratio=4,
-        block_fn=partial(Block, attn_class=MemEffAttention),
+        block_fn=partial(Block, attn_class=MemEffAttentionQKVSplit if split_qkv else MemEffAttention),
         num_register_tokens=num_register_tokens,
         **kwargs,
     )
     return model
 
 
-def vit_large(patch_size=16, num_register_tokens=0, **kwargs):
+def vit_large(patch_size=16, num_register_tokens=0, split_qkv=False, **kwargs):
     model = DinoVisionTransformer(
         patch_size=patch_size,
         embed_dim=1024,
         depth=24,
         num_heads=16,
         mlp_ratio=4,
-        block_fn=partial(Block, attn_class=MemEffAttention),
+        block_fn=partial(Block, attn_class=MemEffAttentionQKVSplit if split_qkv else MemEffAttention),
         num_register_tokens=num_register_tokens,
         **kwargs,
     )
     return model
 
 
-def vit_giant2(patch_size=16, num_register_tokens=0, **kwargs):
+def vit_giant2(patch_size=16, num_register_tokens=0, split_qkv=False, **kwargs):
     """
     Close to ViT-giant, with embed-dim 1536 and 24 heads => embed-dim per head 64
     """
@@ -390,8 +481,96 @@ def vit_giant2(patch_size=16, num_register_tokens=0, **kwargs):
         depth=40,
         num_heads=24,
         mlp_ratio=4,
-        block_fn=partial(Block, attn_class=MemEffAttention),
+        block_fn=partial(Block, attn_class=MemEffAttentionQKVSplit if split_qkv else MemEffAttention),
         num_register_tokens=num_register_tokens,
+        **kwargs,
+    )
+    return model
+
+
+def vit_small_3d(patch_size=16, num_register_tokens=0, split_qkv=False, **kwargs):
+    model = DinoVisionTransformer(
+        patch_size=patch_size,
+        embed_dim=384,
+        depth=12,
+        num_heads=6,
+        mlp_ratio=4,
+        block_fn=partial(Block, attn_class=MemEffAttentionQKVSplit if split_qkv else MemEffAttention),
+        num_register_tokens=num_register_tokens,
+        mode="3D",
+        in_chans=1,
+        embed_layer=PatchEmbed3D,
+        **kwargs,
+    )
+    return model
+
+
+def vit_base_3d(patch_size=16, num_register_tokens=0, split_qkv=False, **kwargs):
+    model = DinoVisionTransformer(
+        patch_size=patch_size,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4,
+        block_fn=partial(Block, attn_class=MemEffAttentionQKVSplit if split_qkv else MemEffAttention),
+        num_register_tokens=num_register_tokens,
+        mode="3D",
+        in_chans=1,
+        embed_layer=PatchEmbed3D,
+        **kwargs,
+    )
+    return model
+
+
+def vit_medium_3d(patch_size=16, num_register_tokens=0, split_qkv=False, **kwargs):
+    model = DinoVisionTransformer(
+        patch_size=patch_size,
+        embed_dim=864,
+        depth=16,
+        num_heads=12,
+        mlp_ratio=4,
+        block_fn=partial(Block, attn_class=MemEffAttentionQKVSplit if split_qkv else MemEffAttention),
+        num_register_tokens=num_register_tokens,
+        mode="3D",
+        in_chans=1,
+        embed_layer=PatchEmbed3D,
+        **kwargs,
+    )
+    return model
+
+
+def vit_large_3d(patch_size=16, num_register_tokens=0, split_qkv=False, **kwargs):
+    model = DinoVisionTransformer(
+        patch_size=patch_size,
+        embed_dim=1024,
+        depth=24,
+        num_heads=16,
+        mlp_ratio=4,
+        block_fn=partial(Block, attn_class=MemEffAttentionQKVSplit if split_qkv else MemEffAttention),
+        num_register_tokens=num_register_tokens,
+        mode="3D",
+        in_chans=1,
+        embed_layer=PatchEmbed3D,
+        **kwargs,
+    )
+    return model
+
+
+def vit_giant2_3d(patch_size=16, num_register_tokens=0, split_qkv=False, **kwargs):
+    """
+    Close to ViT-giant, with embed-dim 1536 and 24 heads => embed-dim per head 64
+    """
+    model = DinoVisionTransformer(
+        patch_size=patch_size,
+        embed_dim=1536,
+        depth=40,
+        num_heads=24,
+        mlp_ratio=4,
+        block_fn=partial(Block, attn_class=MemEffAttentionQKVSplit if split_qkv else MemEffAttention),
+        num_register_tokens=num_register_tokens,
+        mode="3D",
+        in_chans=1,
+        embed_layer=PatchEmbed3D,
         **kwargs,
     )
     return model
