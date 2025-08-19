@@ -13,7 +13,8 @@ import warnings
 
 import torch
 from torch import nn, Tensor
-
+from typing import Optional, List
+from timm.layers import apply_rot_embed_cat
 
 logger = logging.getLogger("dinov2")
 
@@ -42,17 +43,21 @@ class Attention(nn.Module):
         proj_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
+        num_prefix_tokens: int = 0,
+        norm_layer=None
     ) -> None:
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim**-0.5
+        self.num_prefix_tokens = num_prefix_tokens
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = attn_drop
         self.proj = nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
+        self.norm = norm_layer(dim) if norm_layer is not None else nn.Identity()
 
     def init_weights(
         self, init_attn_std: float | None = None, init_proj_std: float | None = None, factor: float = 1.0
@@ -66,15 +71,22 @@ class Attention(nn.Module):
         if self.proj.bias is not None:
             nn.init.zeros_(self.proj.bias)
 
-    def forward(self, x: Tensor, is_causal: bool = False) -> Tensor:
+    def forward(self, x: Tensor, is_causal: bool = False, rope: Optional[Tensor] = None) -> Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
         q, k, v = torch.unbind(qkv, 2)
         q, k, v = [t.transpose(1, 2) for t in [q, k, v]]
+
+        if rope is not None:
+            npt = self.num_prefix_tokens
+            q = torch.cat([q[:, :, :npt, :], apply_rot_embed_cat(q[:, :, npt:, :], rope)], dim=2).type_as(v)
+            k = torch.cat([k[:, :, :npt, :], apply_rot_embed_cat(k[:, :, npt:, :], rope)], dim=2).type_as(v)
+
         x = nn.functional.scaled_dot_product_attention(
             q, k, v, attn_mask=None, dropout_p=self.attn_drop if self.training else 0, is_causal=is_causal
         )
         x = x.transpose(1, 2).contiguous().view(B, N, C)
+        x = self.norm(x)
         x = self.proj_drop(self.proj(x))
         return x
 
@@ -90,12 +102,15 @@ class AttentionQKVSplit(nn.Module):
         proj_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
+        num_prefix_tokens: int = 0,
+        norm_layer=None
     ) -> None:
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim**-0.5
+        self.num_prefix_tokens = num_prefix_tokens
 
         self.q = nn.Linear(dim, dim, bias=q_bias)
         self.k = nn.Linear(dim, dim, bias=k_bias)
@@ -103,6 +118,7 @@ class AttentionQKVSplit(nn.Module):
         self.attn_drop = attn_drop
         self.proj = nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
+        self.norm = norm_layer(dim) if norm_layer is not None else nn.Identity()
 
     def init_weights(
         self, init_attn_std: float | None = None, init_proj_std: float | None = None, factor: float = 1.0
@@ -123,23 +139,29 @@ class AttentionQKVSplit(nn.Module):
         if self.proj.bias is not None:
             nn.init.zeros_(self.proj.bias)
 
-    def forward(self, x: Tensor, is_causal: bool = False) -> Tensor:
+    def forward(self, x: Tensor, is_causal: bool = False, rope: Optional[Tensor] = None) -> Tensor:
         B, N, C = x.shape
         q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads)
         k = self.k(x).reshape(B, N, self.num_heads, C // self.num_heads)
         v = self.v(x).reshape(B, N, self.num_heads, C // self.num_heads)
 
         q, k, v = [t.transpose(1, 2) for t in [q, k, v]]
+        if rope is not None:
+            npt = self.num_prefix_tokens
+            q = torch.cat([q[:, :, :npt, :], apply_rot_embed_cat(q[:, :, npt:, :], rope)], dim=2).type_as(v)
+            k = torch.cat([k[:, :, :npt, :], apply_rot_embed_cat(k[:, :, npt:, :], rope)], dim=2).type_as(v)
+
         x = nn.functional.scaled_dot_product_attention(
             q, k, v, attn_mask=None, dropout_p=self.attn_drop if self.training else 0, is_causal=is_causal
         )
         x = x.transpose(1, 2).contiguous().view(B, N, C)
+        x = self.norm(x)
         x = self.proj_drop(self.proj(x))
         return x
 
 
 class MemEffAttention(Attention):
-    def forward(self, x: Tensor, attn_bias=None) -> Tensor:
+    def forward(self, x: Tensor, attn_bias=None, rope: Optional[Tensor] = None) -> Tensor:
         if not XFORMERS_AVAILABLE:
             if attn_bias is not None:
                 raise AssertionError("xFormers is required for using nested tensors")
@@ -149,17 +171,24 @@ class MemEffAttention(Attention):
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
 
         q, k, v = unbind(qkv, 2)
+        if rope is not None:
+            npt = self.num_prefix_tokens
+            q, k = [t.transpose(1, 2) for t in [q, k]]
+            q = torch.cat([q[:, :, :npt, :], apply_rot_embed_cat(q[:, :, npt:, :], rope)], dim=2).type_as(v)
+            k = torch.cat([k[:, :, :npt, :], apply_rot_embed_cat(k[:, :, npt:, :], rope)], dim=2).type_as(v)
+            q, k = [t.transpose(1, 2) for t in [q, k]]
 
         x = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
         x = x.reshape([B, N, C])
 
+        x = self.norm(x)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
     
 
 class MemEffAttentionQKVSplit(AttentionQKVSplit):
-    def forward(self, x: Tensor, attn_bias=None) -> Tensor:
+    def forward(self, x: Tensor, attn_bias=None, rope: Optional[Tensor] = None, rope_seq_lens: Optional[List[int]] = None) -> Tensor:
         if not XFORMERS_AVAILABLE:
             if attn_bias is not None:
                 raise AssertionError("xFormers is required for using nested tensors")
@@ -169,10 +198,54 @@ class MemEffAttentionQKVSplit(AttentionQKVSplit):
         q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads)
         k = self.k(x).reshape(B, N, self.num_heads, C // self.num_heads)
         v = self.v(x).reshape(B, N, self.num_heads, C // self.num_heads)
+        
+        if isinstance(rope, list) or isinstance(rope, tuple):
+            rope = rope[0]
+
+        if rope is not None:
+            npt = self.num_prefix_tokens
+            q, k = [t.transpose(1, 2) for t in [q, k]]
+            if rope_seq_lens is None:
+                q = torch.cat([q[:, :, :npt, :], apply_rot_embed_cat(q[:, :, npt:, :], rope)], dim=2).type_as(v)
+                k = torch.cat([k[:, :, :npt, :], apply_rot_embed_cat(k[:, :, npt:, :], rope)], dim=2).type_as(v)
+            else:
+                q_list = []
+                k_list = []
+                seq_len_cum_sum = 0
+                rope_len_cum_sum = 0
+                for rope_seq_len in rope_seq_lens:
+                    q_list.append(
+                        torch.cat(
+                            [
+                                q[:, :, seq_len_cum_sum:seq_len_cum_sum+npt, :],
+                                apply_rot_embed_cat(
+                                    q[:, :, seq_len_cum_sum+npt:seq_len_cum_sum+npt+rope_seq_len, :],
+                                    rope[rope_len_cum_sum:rope_len_cum_sum+rope_seq_len]
+                                )
+                            ], dim=2
+                        ).type_as(v)
+                    )
+                    k_list.append(
+                        torch.cat(
+                            [
+                                k[:, :, seq_len_cum_sum:seq_len_cum_sum+npt, :],
+                                apply_rot_embed_cat(
+                                    k[:, :, seq_len_cum_sum+npt:seq_len_cum_sum+npt+rope_seq_len, :],
+                                    rope[rope_len_cum_sum:rope_len_cum_sum+rope_seq_len]
+                                )
+                            ], dim=2
+                        ).type_as(v)
+                    )
+                    seq_len_cum_sum += npt + rope_seq_len
+                    rope_len_cum_sum += rope_seq_len
+                q = torch.cat(q_list, dim=2)
+                k = torch.cat(k_list, dim=2)
+            q, k = [t.transpose(1, 2) for t in [q, k]]
 
         x = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
         x = x.reshape([B, N, C])
 
+        x = self.norm(x)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x

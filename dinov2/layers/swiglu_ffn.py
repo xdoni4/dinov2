@@ -66,6 +66,7 @@ class SwiGLUFFNFused(SwiGLU):
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         hidden_features = (int(hidden_features * 2 / 3) + 7) // 8 * 8
+        # hidden_features = hidden_features * 4 / 3
         super().__init__(
             in_features=in_features,
             hidden_features=hidden_features,

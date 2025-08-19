@@ -5,30 +5,30 @@ ibot:
   separate_head: true
   head_n_prototypes: 512
 train:
-  batch_size_per_gpu: 14 # 64
+  batch_size_per_gpu: 64
   dataset_path: MyDataset3D
   centering: sinkhorn_knopp
 student:
   arch: vit_medium
   mode: 3D
   in_chans: 1
-  pos_embed_for_register_tokens: True
-  use_rope: True
-  use_cls: False
-  up_projection: False
-  rope_ref_shape: 20
-  split_qkv: True
-  patch_size: 8
+  patch_size: 16
   drop_path_rate: 0.4
-  # ffn_layer: swiglufused
-  ffn_layer: swiglu_timm
-  norm_in_attn: True
-  norm_in_ffn: True
+  ffn_layer: swiglufused
   block_chunks: 4
-  num_register_tokens: 0
-  pretrained_from_hub: null
+  num_register_tokens: 4
+  use_rope: False
+  use_cls: True
+  rope_ref_shape: 20
+  norm_in_attn: False
+  norm_in_ffn: False
+  split_qkv: False
+  pos_embed_for_register_tokens: False
+  up_projection: True
+  # pretrained_from_hub:
   #   org: facebookresearch/dinov2
   #   model_name: dinov2_vits14_reg
+  pretrained_from_hub: null
 teacher:
   momentum_teacher: 0.994
   warmup_teacher_temp: 0.01
@@ -41,28 +41,19 @@ optim:
   layerwise_decay: 1.0
 crops:
   # local_crops_size: 96
-  global_crops_size: 128
   local_crops_size: 64
   local_crops_number: 4
 evaluation:
   cls_model:
     head:
       registry: classification_heads
-      model_name : linear_head
-      # model_name : attn_pool
+      model_name: attn_pool
       n_classes: 2
-      # n_classes: 18
       embed_dim: 864
-    patch_size: 8
-    # sw:
-      # patch_size: 128
-      # stride: 64
-      # batch_size: 20
-
-  debug: true
-  eval_period_iterations: 7500 #000
-   
-  
-  head_pretrained_path: null
+    sw:
+      patch_size: 128
+      stride: 64
+      batch_size: 20
+    head_pretrained_path: null
   lr: 2e-5
-  per_device_batch_size: 4
+  per_device_batch_size: 8

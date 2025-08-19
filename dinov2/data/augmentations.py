@@ -378,7 +378,6 @@ class DataAugmentation3DForClassificationOpenmind(object):
                 RandomRotation90(p=0.5, device=self.device, dtype=self.dtype),
                 RandomGaussianBlurOrSharpen(p=0.8, device=self.device, dtype=self.dtype, sigma_high=1.5, do_sharpen=False),
                 RandomGaussianNoise(p=0.8, device=self.device, dtype=self.dtype),
-                # RandomGaussianNoise(p=0.8, device=self.device, dtype=self.dtype),
                 # RandomBrigtness(p=0.8, device=self.device, dtype=self.dtype, brightntess_low=0.1, brightness_high=0.3),
                 # # RandomContrast(p=0.8, device=self.device, dtype=self.dtype, contrast_low=0.6, contrast_high=0.7),
                 # RandomGamma(p=0.8, device=self.device, dtype=self.dtype)

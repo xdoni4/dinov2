@@ -277,6 +277,11 @@ class BraTSClassificationTrain:
         if "image" in fields:
             with gzip.open(path, "rb") as f:
                 image = np.load(f, allow_pickle=True)
+            d, h, w = image.shape
+            dl = max((d - 128) // 2, 0)
+            hl = max((h - 128) // 2, 0)
+            wl = max((w - 128) // 2, 0)
+            image = image[dl:dl+128, hl:hl+128, wl:wl+128]
             mean = image.mean()
             std = image.std()
             ret["image"] = (image - mean) / (std + 1e-8)
@@ -301,6 +306,11 @@ class BraTSClassificationVal:
         if "image" in fields:
             with gzip.open(path, "rb") as f:
                 image = np.load(f, allow_pickle=True)
+            d, h, w = image.shape
+            dl = max((d - 128) // 2, 0)
+            hl = max((h - 128) // 2, 0)
+            wl = max((w - 128) // 2, 0)
+            image = image[dl:dl+128, hl:hl+128, wl:wl+128]
             mean = image.mean()
             std = image.std()
             ret["image"] = (image - mean) / (std + 1e-8)

@@ -242,7 +242,6 @@ def do_test(cfg, model, iteration, only_save=False):
 
             images, labels = data
             current_batch_size = len(images)
-
             # compute losses
             optimizer.zero_grad(set_to_none=True)
             pred = model.cls_model(images)
@@ -364,18 +363,18 @@ def do_train(cfg, model, resume=False):
 
     img_size = cfg.crops.global_crops_size
     patch_size = cfg.student.patch_size
-    n_tokens = (img_size // patch_size) ** 2
+    n_tokens = (img_size // patch_size) ** 3
 
     mask_generator = MaskingGenerator3D(
-        input_size=(128 // 16, 128 // 16, 128 // 16),
-        max_num_patches=0.5 * 128 // 16 * 128 // 16 * 128 // 16
+        input_size=(img_size // patch_size, img_size // patch_size, img_size // patch_size),
+        max_num_patches=0.5 * img_size // patch_size * img_size // patch_size * img_size // patch_size
     )
 
     data_transform = DataAugmentationDINO3DOpenmind(
         local_crops_number=4,
-        initial_crop_size=140,
-        global_crops_size=128,
-        local_crops_size=64,
+        initial_crop_size=int(img_size * 1.1),
+        global_crops_size=img_size,
+        local_crops_size=cfg.crops.local_crops_size,
         batch_size=1,
         device=torch.cuda.current_device(),
         dtype=torch.float16
@@ -385,7 +384,7 @@ def do_train(cfg, model, resume=False):
         collate_data_and_cast,
         mask_ratio_tuple=(0.2, 0.5),
         mask_probability=0.2,
-        n_tokens=(128 // 16) ** 3,
+        n_tokens=n_tokens,
         mask_generator=mask_generator,
         dtype=torch.float16,
         labels_in_sample=False

@@ -57,6 +57,9 @@ class Block(nn.Module):
         norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
         attn_class: Callable[..., nn.Module] = Attention,
         ffn_layer: Callable[..., nn.Module] = Mlp,
+        num_prefix_tokens: Optional[int] = 0,
+        norm_in_attn: bool = False,
+        norm_in_ffn: bool = False
     ) -> None:
         super().__init__()
         # print(f"biases: qkv: {qkv_bias}, proj: {proj_bias}, ffn: {ffn_bias}")
@@ -68,6 +71,8 @@ class Block(nn.Module):
                 proj_bias=proj_bias,
                 attn_drop=attn_drop,
                 proj_drop=drop,
+                norm_layer=norm_layer if norm_in_attn else None,
+                num_prefix_tokens=num_prefix_tokens
             )
         else:
             self.attn = attn_class(
@@ -77,6 +82,8 @@ class Block(nn.Module):
                 proj_bias=proj_bias,
                 attn_drop=attn_drop,
                 proj_drop=drop,
+                norm_layer=norm_layer if norm_in_attn else None,
+                num_prefix_tokens=num_prefix_tokens
             )
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
@@ -85,8 +92,8 @@ class Block(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = ffn_layer(
             in_features=dim,
-            norm_layer=norm_layer,
-            hidden_features=mlp_hidden_dim,
+            norm_layer=norm_layer if norm_in_ffn else None,
+            hidden_features=int(mlp_hidden_dim * 2/3),#mlp_hidden_dim,
             act_layer=act_layer,
             drop=drop,
             bias=ffn_bias,
@@ -96,9 +103,9 @@ class Block(nn.Module):
 
         self.sample_drop_ratio = drop_path
 
-    def forward(self, x: Tensor) -> Tensor:
-        def attn_residual_func(x: Tensor) -> Tensor:
-            return self.ls1(self.attn(self.norm1(x)))
+    def forward(self, x: Tensor, rope: Optional[Tensor] = None) -> Tensor:
+        def attn_residual_func(x: Tensor, rope: Optional[Tensor] = None) -> Tensor:
+            return self.ls1(self.attn(self.norm1(x), rope=rope))
 
         def ffn_residual_func(x: Tensor) -> Tensor:
             return self.ls2(self.mlp(self.norm2(x)))
@@ -109,6 +116,7 @@ class Block(nn.Module):
                 x,
                 residual_func=attn_residual_func,
                 sample_drop_ratio=self.sample_drop_ratio,
+                rope=rope
             )
             x = drop_add_residual_stochastic_depth(
                 x,
@@ -116,10 +124,10 @@ class Block(nn.Module):
                 sample_drop_ratio=self.sample_drop_ratio,
             )
         elif self.training and self.sample_drop_ratio > 0.0:
-            x = x + self.drop_path1(attn_residual_func(x))
-            x = x + self.drop_path1(ffn_residual_func(x))  # FIXME: drop_path2
+            x = x + self.drop_path1(attn_residual_func(x, rope=rope))
+            x = x + self.drop_path2(ffn_residual_func(x))  # FIXME: drop_path2
         else:
-            x = x + attn_residual_func(x)
+            x = x + attn_residual_func(x, rope=rope)
             x = x + ffn_residual_func(x)
         return x
 
@@ -184,6 +192,7 @@ def drop_add_residual_stochastic_depth(
     x: Tensor,
     residual_func: Callable[[Tensor], Tensor],
     sample_drop_ratio: float = 0.0,
+    rope: Optional[Tensor] = None
 ) -> Tensor:
     # 1) extract subset using permutation
     b, n, d = x.shape
@@ -192,7 +201,10 @@ def drop_add_residual_stochastic_depth(
     x_subset = x[brange]
 
     # 2) apply residual_func to get residual
-    residual = residual_func(x_subset)
+    if rope is not None:
+        residual = residual_func(x_subset, rope=rope)
+    else:
+        residual = residual_func(x_subset)
 
     x_flat = x.flatten(1)
     residual = residual.flatten(1)
@@ -219,7 +231,7 @@ def add_residual(x, brange, residual, residual_scale_factor, scaling_vector=None
         x_plus_residual = torch.index_add(x_flat, 0, brange, residual.to(dtype=x.dtype), alpha=residual_scale_factor)
     else:
         x_plus_residual = scaled_index_add(
-            x, brange, residual.to(dtype=x.dtype), scaling=scaling_vector, alpha=residual_scale_factor
+            x.contiguous(), brange, residual.to(dtype=x.dtype).contiguous(), scaling=scaling_vector, alpha=residual_scale_factor
         )
     return x_plus_residual
 
@@ -227,7 +239,7 @@ def add_residual(x, brange, residual, residual_scale_factor, scaling_vector=None
 attn_bias_cache: Dict[Tuple, Any] = {}
 
 
-def get_attn_bias_and_cat(x_list, branges=None):
+def get_attn_bias_and_cat(x_list, branges=None, rope=None):
     """
     this will perform the index select, cat the tensors, and provide the attn_bias from cache
     """
@@ -242,19 +254,37 @@ def get_attn_bias_and_cat(x_list, branges=None):
         attn_bias._batch_sizes = batch_sizes
         attn_bias_cache[all_shapes] = attn_bias
 
+    rope_seq_lens = None
     if branges is not None:
+        # print("SHAPE", [x.shape for x in x_list])
+        # print("branges", branges)
         cat_tensors = index_select_cat([x.flatten(1) for x in x_list], branges).view(1, -1, x_list[0].shape[-1])
+        if (isinstance(rope, list) or isinstance(rope, tuple)) and rope[0] is not None:
+            rope_list = []
+            rope_seq_lens = []
+            for i, brange in enumerate(branges):
+                rope_list.extend([rope[i]] * len(brange))
+                rope_seq_lens.extend([rope[i].shape[0]] * len(brange))
+            rope = torch.cat(rope_list, dim=0)
     else:
         tensors_bs1 = tuple(x.reshape([1, -1, *x.shape[2:]]) for x in x_list)
         cat_tensors = torch.cat(tensors_bs1, dim=1)
+        if rope is not None:
+            rope_list = []
+            rope_seq_lens = []
+            for i, x in enumerate(x_list):
+                rope_list.extend([rope[i]] * x.shape[0])
+                rope_seq_lens.extend([rope[i].shape[0]] * x.shape[0])
+            rope = torch.cat(rope_list, dim=0)
 
-    return attn_bias_cache[all_shapes], cat_tensors
+    return attn_bias_cache[all_shapes], cat_tensors, rope, rope_seq_lens
 
 
 def drop_add_residual_stochastic_depth_list(
     x_list: List[Tensor],
     residual_func: Callable[[Tensor, Any], Tensor],
     sample_drop_ratio: float = 0.0,
+    rope: Optional[List[Tensor]] = None,
     scaling_vector=None,
 ) -> Tensor:
     # 1) generate random set of indices for dropping samples in the batch
@@ -263,10 +293,10 @@ def drop_add_residual_stochastic_depth_list(
     residual_scale_factors = [s[1] for s in branges_scales]
 
     # 2) get attention bias and index+concat the tensors
-    attn_bias, x_cat = get_attn_bias_and_cat(x_list, branges)
+    attn_bias, x_cat, rope, rope_seq_lens = get_attn_bias_and_cat(x_list, branges, rope)
 
     # 3) apply residual_func to get residual, and split the result
-    residual_list = attn_bias.split(residual_func(x_cat, attn_bias=attn_bias))  # type: ignore
+    residual_list = attn_bias.split(residual_func(x_cat, attn_bias=attn_bias, rope=rope, rope_seq_lens=rope_seq_lens))  # type: ignore
 
     outputs = []
     for x, brange, residual, residual_scale_factor in zip(x_list, branges, residual_list, residual_scale_factors):
@@ -275,7 +305,7 @@ def drop_add_residual_stochastic_depth_list(
 
 
 class NestedTensorBlock(Block):
-    def forward_nested(self, x_list: List[Tensor]) -> List[Tensor]:
+    def forward_nested(self, x_list: List[Tensor], rope: Optional[List[Tensor]]) -> List[Tensor]:
         """
         x_list contains a list of tensors to nest together and run
         """
@@ -283,10 +313,10 @@ class NestedTensorBlock(Block):
 
         if self.training and self.sample_drop_ratio > 0.0:
 
-            def attn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
-                return self.attn(self.norm1(x), attn_bias=attn_bias)
+            def attn_residual_func(x: Tensor, attn_bias=None, rope: Optional[List[Tensor]] = None, rope_seq_lens: Optional[List[int]] = None) -> Tensor:
+                return self.attn(self.norm1(x), attn_bias=attn_bias, rope=rope, rope_seq_lens=rope_seq_lens)
 
-            def ffn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
+            def ffn_residual_func(x: Tensor, attn_bias=None, rope=None, rope_seq_lens=None) -> Tensor:
                 return self.mlp(self.norm2(x))
 
             x_list = drop_add_residual_stochastic_depth_list(
@@ -294,6 +324,7 @@ class NestedTensorBlock(Block):
                 residual_func=attn_residual_func,
                 sample_drop_ratio=self.sample_drop_ratio,
                 scaling_vector=self.ls1.gamma if isinstance(self.ls1, LayerScale) else None,
+                rope=rope
             )
             x_list = drop_add_residual_stochastic_depth_list(
                 x_list,
@@ -304,23 +335,23 @@ class NestedTensorBlock(Block):
             return x_list
         else:
 
-            def attn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
-                return self.ls1(self.attn(self.norm1(x), attn_bias=attn_bias))
+            def attn_residual_func(x: Tensor, attn_bias=None, rope: Optional[List[Tensor]] = None, rope_seq_lens: Optional[List[Tensor]] = None) -> Tensor:
+                return self.ls1(self.attn(self.norm1(x), attn_bias=attn_bias, rope=rope, rope_seq_lens=rope_seq_lens))
 
             def ffn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
                 return self.ls2(self.mlp(self.norm2(x)))
 
-            attn_bias, x = get_attn_bias_and_cat(x_list)
-            x = x + attn_residual_func(x, attn_bias=attn_bias)
+            attn_bias, x, rope, rope_seq_lens = get_attn_bias_and_cat(x_list, rope=rope)
+            x = x + attn_residual_func(x, attn_bias=attn_bias, rope=rope, rope_seq_lens=rope_seq_lens)
             x = x + ffn_residual_func(x)
             return attn_bias.split(x)
 
-    def forward(self, x_or_x_list):
+    def forward(self, x_or_x_list, rope: Optional[Tensor] = None):
         if isinstance(x_or_x_list, Tensor):
-            return super().forward(x_or_x_list)
+            return super().forward(x_or_x_list, rope)
         elif isinstance(x_or_x_list, list):
             if not XFORMERS_AVAILABLE:
                 raise AssertionError("xFormers is required for using nested tensors")
-            return self.forward_nested(x_or_x_list)
+            return self.forward_nested(x_or_x_list, rope)
         else:
             raise AssertionError

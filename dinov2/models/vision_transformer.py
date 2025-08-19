@@ -27,7 +27,8 @@ from dinov2.layers import (
     MemEffAttentionQKVSplit,
     NestedTensorBlock as Block
 )
-from timm.layers import SwiGLU as SwiGLU_timm
+from timm.layers import SwiGLU as SwiGLU_timm, RotaryEmbeddingCat
+from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
 
 logger = logging.getLogger("dinov2")
 
@@ -44,9 +45,12 @@ def named_apply(fn: Callable, module: nn.Module, name="", depth_first=True, incl
 
 
 class BlockChunk(nn.ModuleList):
-    def forward(self, x):
+    def forward(self, x, rope=None):
         for b in self:
-            x = b(x)
+            if isinstance(b, nn.Identity):
+                x = b(x)
+            else:
+                x = b(x, rope=rope)
         return x
 
 
@@ -63,6 +67,8 @@ class DinoVisionTransformer(nn.Module):
         qkv_bias=True,
         ffn_bias=True,
         proj_bias=True,
+        norm_in_attn=False,
+        norm_in_ffn=False,
         drop_path_rate=0.0,
         drop_path_uniform=False,
         init_values=None,  # for layerscale: None or 0 => no layerscale
@@ -75,8 +81,11 @@ class DinoVisionTransformer(nn.Module):
         interpolate_antialias=False,
         interpolate_offset=0.1,
         pos_embed_for_register_tokens=False,
-        split_qkv=False,
-        mode="2D"
+        use_rope=False,
+        use_cls=True,
+        rope_ref_shape=224,
+        mode="2D",
+        up_projection=False
     ):
         """
         Args:
@@ -107,7 +116,6 @@ class DinoVisionTransformer(nn.Module):
         norm_layer = partial(nn.LayerNorm, eps=1e-5)
 
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
-        self.num_tokens = 1 + (num_register_tokens if pos_embed_for_register_tokens else 0)
         self.n_blocks = depth
         self.num_heads = num_heads
         self.patch_size = patch_size
@@ -116,6 +124,14 @@ class DinoVisionTransformer(nn.Module):
         self.interpolate_offset = interpolate_offset
         self.mode = mode
         self.pos_embed_for_register_tokens = pos_embed_for_register_tokens
+        self.use_rope = use_rope
+        self.use_cls = use_cls
+        self.num_tokens = (1 if self.use_cls else 0) + (num_register_tokens if pos_embed_for_register_tokens else 0)
+        self.norm_in_attn = norm_in_attn
+        self.norm_in_ffn = norm_in_ffn
+        self.rope_ref_shape = rope_ref_shape
+
+        print("Using cls token: ", self.use_cls)
 
         if self.mode == "3D":
             embed_layer = PatchEmbed3D
@@ -124,6 +140,18 @@ class DinoVisionTransformer(nn.Module):
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
+        
+        if use_rope:
+            rope_dim = round(embed_dim // num_heads / 1.5)
+            assert rope_dim == embed_dim / num_heads / 1.5, "rope dim must be divsible by (num_heads * 1.5)"
+            assert rope_dim % 4 == 0, "rope dim must be divisible by 4"
+            ref_feat_shape = (img_size // patch_size, img_size // patch_size, img_size // patch_size)
+            self.rope = RotaryEmbeddingCat(
+                rope_dim, in_pixels=False, feat_shape=None, ref_feat_shape=(self.rope_ref_shape, self.rope_ref_shape, self.rope_ref_shape)
+            )
+        else:
+            self.rope = None
+
         assert num_register_tokens >= 0
         self.register_tokens = (
             nn.Parameter(torch.zeros(1, num_register_tokens, embed_dim)) if num_register_tokens else None
@@ -167,6 +195,9 @@ class DinoVisionTransformer(nn.Module):
                 act_layer=act_layer,
                 ffn_layer=ffn_layer,
                 init_values=init_values,
+                norm_in_attn=norm_in_attn,
+                norm_in_ffn=norm_in_ffn,
+                num_prefix_tokens=self.num_tokens
             )
             for i in range(depth)
         ]
@@ -186,6 +217,12 @@ class DinoVisionTransformer(nn.Module):
         self.head = nn.Identity()
 
         self.mask_token = nn.Parameter(torch.zeros(1, embed_dim))
+        
+        self.up_projection = None
+        if up_projection:
+            self.up_projection = PatchDecode(
+                (8, 8, 8), embed_dim, 2, norm=LayerNormNd, activation=nn.GELU
+            )
 
         self.init_weights()
 
@@ -244,7 +281,8 @@ class DinoVisionTransformer(nn.Module):
             self.pos_embed_for_register_tokens and (self.register_tokens is not None) else None
         tokens_pos_embed = torch.cat((class_pos_embed.unsqueeze(0), reg_pos_embed), dim=1) \
             if reg_pos_embed is not None else class_pos_embed.unsqueeze(0)
-
+        if not self.use_cls:
+            tokens_pos_embed = tokens_pos_embed[:, 1:, :]
         dim = x.shape[-1]
         h0 = h // self.patch_size
         w0 = w // self.patch_size
@@ -288,8 +326,10 @@ class DinoVisionTransformer(nn.Module):
         tokens = self.cls_token.expand(x.shape[0], -1, -1) \
             if (not self.pos_embed_for_register_tokens) or (self.register_tokens is None) \
             else torch.cat((self.cls_token.expand(x.shape[0], -1, -1), self.register_tokens.expand(x.shape[0], -1, -1)), dim=1)
-        
-        x = torch.cat((tokens, x), dim=1)
+        if not self.use_cls:
+            tokens = None # tokens[:, 1:, :]
+
+        x = torch.cat((tokens, x), dim=1) if tokens is not None else x
         if self.mode == "2D":
             x = x + self._interpolate_pos_encoding_2d(x, w, h)
         else:
@@ -304,25 +344,27 @@ class DinoVisionTransformer(nn.Module):
                 ),
                 dim=1,
             )
-
-        return x
+        shape = (d // self.patch_size, h // self.patch_size, w // self.patch_size)
+        rot_pos_emb = self.rope.get_embed(shape=shape) if self.use_rope else None
+        return x, rot_pos_emb
 
     def forward_features_list(self, x_list, masks_list):
         if masks_list is None:
             masks_list = [None] * len(x_list)
-        x = [self.prepare_tokens_with_masks(x, masks) for x, masks in zip(x_list, masks_list)]
+        x, rot_pos_emb = zip(*[self.prepare_tokens_with_masks(x, masks) for x, masks in zip(x_list, masks_list)])
         for blk in self.blocks:
-            x = blk(x)
+            x = blk(list(x), rope=rot_pos_emb)
 
         all_x = x
         output = []
         for x, masks in zip(all_x, masks_list):
             x_norm = self.norm(x)
+            cls_present = 1 if self.use_cls else 0
             output.append(
                 {
-                    "x_norm_clstoken": x_norm[:, 0],
-                    "x_norm_regtokens": x_norm[:, 1 : self.num_register_tokens + 1],
-                    "x_norm_patchtokens": x_norm[:, self.num_register_tokens + 1 :],
+                    "x_norm_clstoken": x_norm[:, 0] if self.use_cls else x_norm.mean(dim=1, keepdim=False),
+                    "x_norm_regtokens": x_norm[:, cls_present : self.num_register_tokens + cls_present],
+                    "x_norm_patchtokens": x_norm[:, self.num_register_tokens + cls_present:],
                     "x_prenorm": x,
                     "masks": masks,
                 }
@@ -333,16 +375,17 @@ class DinoVisionTransformer(nn.Module):
         if isinstance(x, list):
             return self.forward_features_list(x, masks)
 
-        x = self.prepare_tokens_with_masks(x, masks)
+        x, rot_pos_emb = self.prepare_tokens_with_masks(x, masks)
 
         for blk in self.blocks:
-            x = blk(x)
+            x = blk(x, rope=rot_pos_emb)
 
         x_norm = self.norm(x)
+        cls_present = 1 if self.use_cls else 0
         return {
-            "x_norm_clstoken": x_norm[:, 0],
-            "x_norm_regtokens": x_norm[:, 1 : self.num_register_tokens + 1],
-            "x_norm_patchtokens": x_norm[:, self.num_register_tokens + 1 :],
+            "x_norm_clstoken": x_norm[:, 0] if self.use_cls else x_norm.mean(dim=1, keepdim=False),
+            "x_norm_regtokens": x_norm[:, cls_present : self.num_register_tokens + cls_present],
+            "x_norm_patchtokens": x_norm[:, self.num_register_tokens + cls_present :],
             "x_prenorm": x,
             "masks": masks,
         }
@@ -401,6 +444,12 @@ class DinoVisionTransformer(nn.Module):
 
     def forward(self, *args, is_training=True, **kwargs):
         ret = self.forward_features(*args, **kwargs)
+        if self.up_projection is not None:
+            import numpy as np
+            prod_n_patches = np.prod(ret["x_norm_patchtokens"].shape)
+            bs = ret["x_norm_patchtokens"].shape[0]
+            n_patches_dim = int(round((prod_n_patches.item() // (self.embed_dim * bs)) ** (1 / 3)))
+            return self.up_projection(ret["x_norm_patchtokens"].movedim(1, 2).reshape(-1, self.embed_dim, n_patches_dim, n_patches_dim, n_patches_dim))
         if is_training:
             return ret
         else:
@@ -436,7 +485,7 @@ def vit_medium(patch_size=16, num_register_tokens=0, split_qkv=False, **kwargs):
         depth=16,
         num_heads=12,
         mlp_ratio=4,
-        block_fn=partial(Block, attn_class=MemEffAttentionQKVSplit if split_qkv else MemEffAttention),
+        block_fn=partial(Block, attn_class=MemEffAttentionQKVSplit if split_qkv else MemEffAttention),#
         num_register_tokens=num_register_tokens,
         **kwargs,
     )
