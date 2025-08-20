@@ -16,9 +16,8 @@ dependencies = [
   "flash_attn==2.0.2",
   "cotomka @ git+https://github.com/mishgon/cotomka@cb1143188a8c772bc4c96c565671b52c8121bfbf",
   "xformers @ git+https://github.com/facebookresearch/xformers@v0.0.28.post3",
-  "medeval @ git+https://github.com/xdoni4/medeval@d98f3dee98a4534901b8f8f927602e09e962aaee",
+  "medeval @ git+https://github.com/xdoni4/medeval@15de59a4b16d83b7782b19be1786d0c775b96e16",
   "ipykernel"
-
 ]
 [build-system]
 requires = ["pdm-backend"]
