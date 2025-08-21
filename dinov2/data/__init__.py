@@ -22,3 +22,25 @@ from .augmentations import (
     DataAugmentation3DForClassificationVal
 )
 from .masking import MaskingGenerator, MaskingGenerator3D
+
+from .dataset import (
+    CTRATETrainPreprocessed,
+    CTRATEValPreprocessed,
+    OpenNeuroPreprocessed,
+    BraTSClassificationTrain,
+    BraTSClassificationVal,
+    AMOSCTUnlabeledTrainPreprocessed,
+    AbdomenAtlasPreprocessed
+)
+
+data_source_name_to_data_class = {
+    "ct_rate_train" : CTRATETrainPreprocessed,
+    "ct_rate_val" : CTRATEValPreprocessed,
+    "openneuro" : OpenNeuroPreprocessed,
+    "brats_cls_train" : BraTSClassificationTrain,
+    "brats_cls_val" : BraTSClassificationVal,
+    "amos_train" : AMOSCTUnlabeledTrainPreprocessed,
+    "abdomen_atlas" : AbdomenAtlasPreprocessed
+}
+
+# data_

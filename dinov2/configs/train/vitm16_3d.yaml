@@ -6,7 +6,9 @@ ibot:
   head_n_prototypes: 512
 train:
   batch_size_per_gpu: 14 # 64
-  dataset_path: MyDataset3D
+  # dataset_path: MyDataset3D
+  sources:
+    - openneuro
   centering: sinkhorn_knopp
 student:
   arch: vit_medium
@@ -58,10 +60,14 @@ evaluation:
       # patch_size: 128
       # stride: 64
       # batch_size: 20
+  sources_train:
+    - brats_cls_train
+  sources_val:
+    - brats_cls_val
+  epoch_size_mult: 20
 
-  debug: true
+  debug: false
   eval_period_iterations: 7500 #000
-   
   
   head_pretrained_path: null
   lr: 2e-5

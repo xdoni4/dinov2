@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import logging
 import argparse
+from pathlib import Path
 import dinov2.distributed as distributed
 
 
@@ -48,6 +49,7 @@ from dinov2.data.dataset import (
     BraTSClassificationTrain,
     BraTSClassificationVal
 )
+from dinov2.data import data_source_name_to_data_class
 from dinov2.data.masking import MaskingGenerator3D
 from dinov2.train.ssl_meta_arch import SSLMetaArch
 from nnssl.data.raw_dataset import Collection
@@ -150,17 +152,23 @@ def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
 
 
 def do_test(cfg, model, iteration, only_save=False):
-    # test_data_train_transform = DataAugmentation3DForClassification(device=torch.cuda.current_device(), dtype=torch.float16)
-    test_data_train_transform = DataAugmentation3DForClassificationOpenmind(device=torch.cuda.current_device(), dtype=torch.float16)
-    # test_data_val_transform = DataAugmentation3DForClassificationVal(device=torch.cuda.current_device(), dtype=torch.float16)
-    test_data_val_transform = DataAugmentation3DForClassificationValOpenmind(device=torch.cuda.current_device(), dtype=torch.float16)
+    if "openneuro" in cfg.train.sources:
+        test_data_train_transform = DataAugmentation3DForClassificationOpenmind(device=torch.cuda.current_device(), dtype=torch.float16)
+        test_data_val_transform = DataAugmentation3DForClassificationValOpenmind(device=torch.cuda.current_device(), dtype=torch.float16)
+    else:
+        test_data_train_transform = DataAugmentation3DForClassification(device=torch.cuda.current_device(), dtype=torch.float16)
+        test_data_val_transform = DataAugmentation3DForClassificationVal(device=torch.cuda.current_device(), dtype=torch.float16)
+
     test_collate_fn = collate_data_for_test
     
-   
 
     def create_test_dataloader_train():
+        data_sources_train = [
+            data_source_name_to_data_class[source_name]() for source_name in 
+            cfg.evaluation.sources_train
+        ]
         test_dataset_prefetch = MedicalImageDatasetDINO(
-            sources = [BraTSClassificationTrain()], # CTRATETrainPreprocessed()
+            sources = data_sources_train,
             prefetch=True,
             replication=32,
             prefetch_workers=4,
@@ -179,8 +187,12 @@ def do_test(cfg, model, iteration, only_save=False):
         return dl
 
     def create_test_dataloader_val():
+        data_sources_val = [
+            data_source_name_to_data_class[source_name]() for source_name in 
+            cfg.evaluation.sources_val
+        ]
         test_dataset_val = MedicalImageDatasetDINO(
-            sources = [BraTSClassificationVal()], # CTRATEValPreprocessed()
+            sources = data_sources_val,
             prefetch=True,
             replication=1,
             prefetch_buffer_size=128,
@@ -224,7 +236,8 @@ def do_test(cfg, model, iteration, only_save=False):
         header_train = "Linear probing train"
         header_val = "Linear probing val"
         start_iter = 0
-        max_iter = 20 * len(test_data_loader_train.prefetched_dataset) // (test_data_loader_train.batch_size * distributed.get_global_size())
+        epoch_size_mult = cfg.evaluation.get(epoch_size_mult, 1)
+        max_iter = epoch_size_mult * len(test_data_loader_train.prefetched_dataset) // (test_data_loader_train.batch_size * distributed.get_global_size())
         if cfg.evaluation.get("debug", None):
             max_iter = 200
         cur_iteration = start_iter
@@ -370,7 +383,8 @@ def do_train(cfg, model, resume=False):
         max_num_patches=0.5 * img_size // patch_size * img_size // patch_size * img_size // patch_size
     )
 
-    data_transform = DataAugmentationDINO3DOpenmind(
+    data_aug_cls = DataAugmentationDINO3DOpenmind if "openneuro" in cfg.train.sources else DataAugmentationDINO3D
+    data_transform = data_aug_cls(
         local_crops_number=4,
         initial_crop_size=int(img_size * 1.1),
         global_crops_size=img_size,
@@ -391,24 +405,28 @@ def do_train(cfg, model, resume=False):
     )
 
     def create_train_dataloader():
-        os.environ['nnssl_raw'] = '/home/jovyan/datasets/OpenMind'
-        os.environ['nnssl_preprocessed'] = '/home/jovyan/misha/misc/cotomka'
+        if "openneuro" in cfg.train.sources:
+            nnssl_preprocessed_path = Path(os.getenv("nnssl_preprocessed"))
+            with open(nnssl_preprocessed_path / "Dataset745_OpenMind/pretrain_data__onemmiso.json", "r") as f:
+                pretrain_data_json = json.load(f)
 
-        with open("/home/jovyan/misha/misc/cotomka/Dataset745_OpenMind/pretrain_data__onemmiso.json", "r") as f:
-            pretrain_data_json = json.load(f)
+            collection = Collection.from_dict(pretrain_data_json)
 
-        collection = Collection.from_dict(pretrain_data_json)
-
-        subject_identifiers = get_subject_identifiers("/home/jovyan/misha/misc/cotomka/Dataset745_OpenMind/nnsslPlans_onemmiso/")
-        dataset_openneuro = OpenNeuroPreprocessed(
-            "/home/jovyan/misha/misc/cotomka/Dataset745_OpenMind/nnsslPlans_onemmiso/",
-            collection,
-            subject_identifiers=subject_identifiers
-        )
+            subject_identifiers = get_subject_identifiers(nnssl_preprocessed_path / "Dataset745_OpenMind/nnsslPlans_onemmiso/")
+            dataset_openneuro = OpenNeuroPreprocessed(
+                nnssl_preprocessed_path / "Dataset745_OpenMind/nnsslPlans_onemmiso/",
+                collection,
+                subject_identifiers=subject_identifiers
+            )
+            data_sources = [dataset_openneuro]
+        else:
+            data_sources = [
+                data_source_name_to_data_class[source_name]() for source_name in 
+                cfg.train.sources
+            ]
 
         dataset_prefetch = MedicalImageDatasetDINO(
-            # sources = [CTRATETrainPreprocessed(), AbdomenAtlasPreprocessed(), AMOSCTUnlabeledTrainPreprocessed()],
-            sources = [dataset_openneuro],
+            sources=data_sources,
             transform=None,
             prefetch=True,
             replication=32,
@@ -525,6 +543,9 @@ def do_train(cfg, model, resume=False):
 
 
 def main(args):
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    os.environ["CUDA_MPS_PIPE_DIRECTORY"] = "/tmp/nvidia-mps/"
+    os.environ["CUDA_MPS_LOG_DIRECTORY"] = "/tmp/nvidia-log/"
     cfg = setup(args)
 
     model = SSLMetaArch(cfg).to(torch.device("cuda"))
