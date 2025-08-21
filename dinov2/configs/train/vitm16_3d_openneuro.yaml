@@ -1,0 +1,64 @@
+dino:
+  head_n_prototypes: 512
+  head_bottleneck_dim: 384
+ibot:
+  separate_head: true
+  head_n_prototypes: 512
+train:
+  batch_size_per_gpu: 14
+  sources:
+    - openneuro
+  centering: sinkhorn_knopp
+student:
+  arch: vit_medium
+  mode: 3D
+  in_chans: 1
+  pos_embed_for_register_tokens: True
+  use_rope: True
+  use_cls: False
+  up_projection: False
+  rope_ref_shape: 20
+  split_qkv: True
+  patch_size: 8
+  drop_path_rate: 0.4
+  ffn_layer: swiglu_timm
+  norm_in_attn: True
+  norm_in_ffn: True
+  block_chunks: 4
+  num_register_tokens: 0
+  pretrained_from_hub: null
+teacher:
+  momentum_teacher: 0.994
+  warmup_teacher_temp: 0.01
+  teacher_temp: 0.04
+optim:
+  epochs: 500
+  weight_decay_end: 0.2
+  base_lr: 2e-04
+  warmup_epochs: 0
+  layerwise_decay: 1.0
+crops:
+  global_crops_size: 128
+  local_crops_size: 64
+  local_crops_number: 4
+evaluation:
+  cls_model:
+    head:
+      registry: classification_heads
+      model_name : linear_head
+      n_classes: 2
+      embed_dim: 864
+    patch_size: 8
+  sources_train:
+    - brats_cls_train
+  sources_val:
+    - brats_cls_val
+  epoch_size_mult: 20
+  only_save: True
+
+  debug: false
+  eval_period_iterations: 7500 #000
+  
+  head_pretrained_path: null
+  lr: 2e-5
+  per_device_batch_size: 4
