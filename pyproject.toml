@@ -14,7 +14,7 @@ dependencies = [
   "fvcore==0.1.5.post20221221",
   "iopath==0.1.10",
   "flash_attn==2.0.2",
-  "cotomka @ git+https://github.com/mishgon/cotomka@cb1143188a8c772bc4c96c565671b52c8121bfbf",
+  "cotomka @ git+https://github.com/mishgon/cotomka@e38a45929d98e22ca10ba33dd4d79ea53a01d882",
   "xformers @ git+https://github.com/facebookresearch/xformers@v0.0.28.post3",
   "medeval @ git+https://github.com/xdoni4/medeval@15de59a4b16d83b7782b19be1786d0c775b96e16",
   "ipykernel"
