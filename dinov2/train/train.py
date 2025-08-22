@@ -151,7 +151,7 @@ def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
         param_group["lr"] = (last_layer_lr if is_last_layer else lr) * lr_multiplier
 
 
-def do_test(cfg, model, iteration, only_save=False):
+def do_test(cfg, model, iteration):
     if "openneuro" in cfg.train.sources:
         test_data_train_transform = DataAugmentation3DForClassificationOpenmind(device=torch.cuda.current_device(), dtype=torch.float16)
         test_data_val_transform = DataAugmentation3DForClassificationValOpenmind(device=torch.cuda.current_device(), dtype=torch.float16)
@@ -223,6 +223,7 @@ def do_test(cfg, model, iteration, only_save=False):
             torch.save({"teacher": new_teacher_state_dict}, teacher_ckp_path)
             torch.save({"cls_head" : new_cls_head_state_dict}, cls_head_ckp_path)
     
+    only_save = cfg.evaluation.get("only_save", False)
     if not only_save:
         model.cls_model.backbone.eval()
         test_data_loader_train = create_test_dataloader_train()
@@ -525,8 +526,8 @@ def do_train(cfg, model, resume=False):
             del data
             data_loader.prefetched_dataset.destroy()
 
-            only_save = False
-            validation_metrics = do_test(cfg, model, f"manual_{iteration}", only_save=only_save)
+            only_save = cfg.evaluation.get("only_save", False)
+            validation_metrics = do_test(cfg, model, f"manual_{iteration}")
             if not only_save:
                 metric_logger.update(**validation_metrics)
             torch.cuda.synchronize()
