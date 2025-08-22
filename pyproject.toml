@@ -18,6 +18,7 @@ dependencies = [
   "xformers @ git+https://github.com/facebookresearch/xformers@v0.0.28.post3",
   "medeval @ git+https://github.com/xdoni4/medeval@15de59a4b16d83b7782b19be1786d0c775b96e16",
   "nnssl @ git+https://github.com/MIC-DKFZ/nnssl",
+  "nnunetv2 @ git+https://github.com/TaWald/nnUNet@0367754f14d84d5822020d49c05c9e52bb62d8b3"
   "opencv-python-headless",
   "ipykernel"
 ]
